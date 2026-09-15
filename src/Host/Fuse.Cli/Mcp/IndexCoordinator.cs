@@ -148,12 +148,14 @@ public sealed class IndexCoordinator
     /// </summary>
     private sealed class IndexWriterLock : IDisposable
     {
-        private readonly Mutex? _mutex;
-        private bool _released;
+        private readonly ManualResetEventSlim _release;
+        private readonly Task _owner;
+        private int _disposed;
 
-        private IndexWriterLock(Mutex? mutex, bool isOwner)
+        private IndexWriterLock(ManualResetEventSlim release, Task owner, bool isOwner)
         {
-            _mutex = mutex;
+            _release = release;
+            _owner = owner;
             IsOwner = isOwner;
         }
 
@@ -161,40 +163,75 @@ public sealed class IndexCoordinator
 
         public static IndexWriterLock TryAcquire(string repositoryRoot)
         {
-            var mutex = new Mutex(initiallyOwned: false, WriterMutexName(repositoryRoot));
-            bool owned;
+            var release = new ManualResetEventSlim();
+            var acquired = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            // Mutex ownership is thread-affine. The index pipeline awaits I/O, so a dedicated owner must
+            // acquire AND release the mutex while the async caller holds this lease across continuations.
+            var owner = Task.Factory.StartNew(() =>
+            {
+                try
+                {
+                    using var mutex = new Mutex(initiallyOwned: false, WriterMutexName(repositoryRoot));
+                    bool owned;
+                    try
+                    {
+                        owned = mutex.WaitOne(TimeSpan.Zero);
+                    }
+                    catch (AbandonedMutexException)
+                    {
+                        owned = true;
+                    }
+
+                    acquired.SetResult(owned);
+                    if (!owned)
+                        return;
+                    try
+                    {
+                        release.Wait();
+                    }
+                    finally
+                    {
+                        mutex.ReleaseMutex();
+                    }
+                }
+                catch (Exception exception)
+                {
+                    acquired.TrySetException(exception);
+                    throw;
+                }
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
             try
             {
-                owned = mutex.WaitOne(TimeSpan.Zero);
+                return new IndexWriterLock(release, owner, acquired.Task.GetAwaiter().GetResult());
             }
-            catch (AbandonedMutexException)
+            catch
             {
-                owned = true;
+                try
+                {
+                    owner.GetAwaiter().GetResult();
+                }
+                finally
+                {
+                    release.Dispose();
+                }
+                throw;
             }
-
-            if (!owned)
-            {
-                mutex.Dispose();
-                return new IndexWriterLock(null, isOwner: false);
-            }
-
-            return new IndexWriterLock(mutex, isOwner: true);
         }
 
         public void Dispose()
         {
-            if (!IsOwner || _mutex is null || _released)
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
-            _released = true;
+            _release.Set();
             try
             {
-                _mutex.ReleaseMutex();
+                _owner.GetAwaiter().GetResult();
             }
-            catch (ApplicationException)
+            finally
             {
+                _release.Dispose();
             }
-
-            _mutex.Dispose();
         }
 
         private static string WriterMutexName(string repositoryRoot)
