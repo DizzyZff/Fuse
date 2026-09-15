@@ -120,17 +120,19 @@ public sealed class SemanticIndexer
     /// <summary>
     ///     Indexes the workspace at the syntax tier only, skipping the MSBuild/Roslyn load, so a first call
     ///     serves context in a few seconds instead of waiting for the full semantic load. Sets the index mode to
-    ///     <c>syntax</c>. Compiler analysis starts only from an explicit semantic request.
+    ///     <c>syntax</c> unless a current compiler-backed index can be reused. Compiler analysis starts only
+    ///     from an explicit semantic request. Changed inputs invalidate previously stored compiler facts.
     /// </summary>
     /// <param name="rootDirectory">The workspace root.</param>
     /// <param name="store">The index store to write to.</param>
     /// <param name="cancellationToken">A token to cancel the index.</param>
     /// <param name="progress">An optional synchronous observer for inventory and syntax-stage progress.</param>
-    /// <returns>A syntax-tier index summary.</returns>
+    /// <returns>The reused compiler-backed summary, or a syntax-tier index summary.</returns>
     /// <remarks>
     ///     The cold index time is dominated by the MSBuild evaluation, not the syntax extraction, so the
     ///     syntax-first pass produces a usable full-text and symbol index without loading MSBuild. Cross-file
-    ///     semantic facts are added only by a requested compiler pass.
+    ///     semantic facts are added only by a requested compiler pass. The caller must hold the repository
+    ///     writer lock for this entire operation, including the reuse decision and all persistence.
     /// </remarks>
     public async Task<SemanticIndexResult> IndexSyntaxFirstAsync(
         string rootDirectory,
@@ -139,7 +141,25 @@ public sealed class SemanticIndexer
         IProgress<SemanticIndexProgress>? progress = null)
     {
         var root = Path.GetFullPath(rootDirectory);
+        // Callers serialize this whole operation with the repository writer coordinator. Check before any
+        // manifest, TFM, symbol, or diagnosis write; preserving only index_mode would hide lost compiler facts.
+        var previous = await store.GetStateAsync(cancellationToken);
+        var hadCompilerFacts = previous.Mode is "semantic" or "partial";
+        var compilerInvalidated = hadCompilerFacts
+            || await store.GetMetaAsync(SemanticIndexReuse.InvalidatedMetaKey, cancellationToken) == "1";
+        if (hadCompilerFacts)
+        {
+            var reused = await SemanticIndexReuse.TryReadAsync(root, store, _inventory, cancellationToken);
+            if (reused is not null)
+                return reused;
+
+            // A syntax refresh cannot recompute cross-file facts, including facts in unchanged files that
+            // depended on an edited/deleted declaration. Discard the invalid derived index as one rebuild.
+            await store.ResetAsync(cancellationToken);
+        }
         await WorkspaceIndexManifest.BeginBuildAsync(root, store, cancellationToken);
+        if (compilerInvalidated)
+            await store.SetMetaAsync(SemanticIndexReuse.InvalidatedMetaKey, "1", cancellationToken);
         progress?.Report(new SemanticIndexProgress(
             SemanticIndexStage.Inventory,
             0,
@@ -155,7 +175,9 @@ public sealed class SemanticIndexer
         var snapshot = new RoslynWorkspaceSnapshot(
             SemanticLoadSucceeded: false,
             Projects: [],
-            Diagnostics: [new DiagnosticRecord(DiagnosticSeverity.Info, "syntax-first", "Syntax-tier index served first; run 'fuse index --semantic' to add compiler facts.")],
+            Diagnostics: [compilerInvalidated
+                ? new DiagnosticRecord(DiagnosticSeverity.Warning, "semantic-invalidated", SemanticIndexReuse.InvalidatedMessage)
+                : new DiagnosticRecord(DiagnosticSeverity.Info, "syntax-first", "Syntax-tier index served first; run 'fuse index --semantic' to add compiler facts.")],
             ProjectReports: []);
 
         await store.ReplaceTfmAvailabilityAsync([], cancellationToken);
@@ -168,7 +190,10 @@ public sealed class SemanticIndexer
         // indexable at this depth; only an explicit semantic request needs workspace selection.
         await _finalizer.StampLoadDiagnosisAsync(
             store,
-            WorkspaceLoadDiagnoser.BuildSyntaxFirst(snapshot),
+            WorkspaceLoadDiagnoser.BuildSyntaxFirst(snapshot) with
+            {
+                SelectionNote = compilerInvalidated ? SemanticIndexReuse.InvalidatedMessage : "compiler analysis has not been requested",
+            },
             cancellationToken);
         // Stamp the Fuse build even on the syntax-first pass so a partial index also carries provenance.
         await store.SetMetaAsync(WorkspaceIndexStore.FuseVersionMetaKey, FuseBuildInfo.Current, cancellationToken);
@@ -234,6 +259,8 @@ public sealed class SemanticIndexer
 
         await store.SetMetaAsync("index_mode", result.Mode, cancellationToken);
         await store.SetMetaAsync(SemanticPendingMetaKey, "0", cancellationToken);
+        if (result.Mode is "semantic" or "partial")
+            await store.SetMetaAsync(SemanticIndexReuse.InvalidatedMetaKey, "0", cancellationToken);
         // R43: stamp the per-project load diagnosis so doctor reports the tier from the warm index (no live load).
         await _finalizer.StampLoadDiagnosisAsync(store, diagnosis, cancellationToken);
         await store.SetMetaAsync(WorkspaceIndexStore.FuseVersionMetaKey, FuseBuildInfo.Current, cancellationToken);
@@ -358,6 +385,7 @@ public sealed class SemanticIndexer
         var result = await _semanticIndexWriter.WriteCaptureAsync(root, store, files, capture, cancellationToken);
         await store.SetMetaAsync("index_mode", result.Mode, cancellationToken);
         await store.SetMetaAsync(SemanticPendingMetaKey, "0", cancellationToken);
+        await store.SetMetaAsync(SemanticIndexReuse.InvalidatedMetaKey, "0", cancellationToken);
         await store.SetMetaAsync(WorkspaceIndexStore.FuseVersionMetaKey, FuseBuildInfo.Current, cancellationToken);
         // R22: stamp the extraction-contract version so index reuse is gated on what was extracted, not the product
         // version. Bump WorkspaceIndexSchema.ExtractionContractVersion in the same change as any extractor change.

@@ -6,6 +6,7 @@ namespace Fuse.Cli.Mcp;
 /// <summary>
 ///     Starts syntax-only warm requests through the host-owned repository job manager. Eager work is visible to
 ///     status and cancellable through the same lifecycle as an explicit <c>fuse index</c> request.
+///     The indexer reuses current compiler-backed data rather than replacing it at a lower depth.
 /// </summary>
 public sealed class EagerIndex
 {

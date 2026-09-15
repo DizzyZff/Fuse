@@ -83,3 +83,9 @@ In-session upgrade is a clean handoff, not a kill race. Auto-update (default-on 
 ## Why one daemon
 
 The .NET ecosystem already normalizes a per-repository server that amortizes cold start (the compiler server, MSBuild node reuse), including its failure modes: orphaned processes, spawn races, and stale versions after an upgrade. Fuse's daemon addresses each by construction: the single-instance lock (one owner, crash-recoverable via an abandoned-mutex takeover), idle shutdown (no lingering process), and the protocol-version handshake (a stale client refuses). The warm compilation becomes a shared asset, so a second agent session on a repository is warm immediately.
+
+### Preserving compiler facts during refresh
+
+After `fuse index --semantic`, an eager warm, watcher tick, or on-read syntax request reuses the existing semantic/partial index when its manifest, extraction version, and current source hashes match. It leaves symbols, graph edges, target-framework availability, and load diagnosis intact. Validation and the subsequent write share the repository writer lock, so a queued syntax request rechecks the index after an earlier compiler writer finishes. A lightweight job may still appear in status; reuse does not run extraction.
+
+When the inventory changes or the compiler index is incomplete, a syntax refresh discards the invalid derived index and rebuilds fresh syntax data. It reports `semantic-invalidated` in job warnings and records the reason in the load diagnosis. This also clears derived verification-session state. Run `fuse index --semantic` to restore compiler facts; background refreshes do not start compiler work automatically. `--force` continues to discard an unchanged index explicitly.

@@ -2,6 +2,13 @@
 
 All notable changes to Fuse are documented here. The format is based on Keep a Changelog. Fuse 4.0.0 is the first public release; it carries the whole product and there is no prior public version to migrate from.
 
+## Unreleased
+
+### Fixed
+
+- The cross-process index writer mutex is now acquired and released by the same dedicated owner thread. Async indexing continuations no longer abandon ownership or leave later jobs reporting `index_busy`. Restart existing daemons to release old locks.
+- Eager warm, watcher, and on-read syntax jobs reuse a complete, compatible semantic/partial index when the source inventory is unchanged. The reuse decision runs inside the repository writer lock, before any symbol, graph, TFM, or diagnosis mutation. Changed or invalid inventories explicitly discard the derived compiler index and rebuild syntax data, with a persistent diagnostic directing users to `fuse index --semantic`. This rebuild also resets derived verification-session state, as a forced rebuild does. Compiler work remains opt-in. Restart the daemon after updating; no schema migration is required. If an older version already downgraded the index, run `fuse index --semantic` once to restore compiler facts.
+
 ## [4.4.0] - 2026-07-30
 
 ### Added
